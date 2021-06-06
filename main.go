@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Shopify/sarama"
 	"github.com/joho/godotenv"
@@ -21,7 +22,15 @@ import (
 var envs struct {
 	Kafka struct {
 		Addr  string `envconfig:"KAFKA_ADDR"`
-		Topic string `envconfig:"KAFKA_TOPIC"`
+		Topic struct {
+			IsDead bool   `envconfig:"KAFKA_TOPIC_IS_DEAD"`
+			Name   string `envconfig:"KAFKA_TOPIC_NAME"`
+			Dead   struct {
+				Name                string        `envconfig:"KAFKA_TOPIC_DEAD_NAME"`
+				ConsumptionInterval time.Duration `envconfig:"KAFKA_TOPIC_DEAD_CONSUMPTION_INTERVAL" default:"10s"`
+			}
+		}
+		GroupID string `envconfig:"KAFKA_GROUP_ID" required:"true"`
 	}
 	Gosuslugi struct {
 		Host string `envconfig:"GOSUSLUGI_HOST" required:"true"`
@@ -52,44 +61,117 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	validatorService := services.NewVoterValidator(envs.Gosuslugi.Host)
+
+	closeConsumer, err := startConsumer(ctx, validatorService)
+	if err != nil {
+		return err
+	}
+
+	sigint := make(chan os.Signal, 1)
+	signal.Notify(sigint, syscall.SIGINT)
+
+	sig := <-sigint
+	log.Info().Msgf("main: Waiting consumer group %q to complete", envs.Kafka.GroupID)
+	cancel()
+	if err := closeConsumer(); err != nil {
+		return err
+	}
+	log.Info().Msgf("main: Terminated via signal %q", sig)
+	return nil
+}
+
+// startConsumer selects consumer with type based on "KAFKA_TOPIC_IS_DEAD" env value and starts listening
+func startConsumer(ctx context.Context, validatorService *services.VoterValidator) (close func() error, err error) {
 	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Errors = true
 	cfg.Consumer.Return.Errors = true
 	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
 
-	consumerGroup, err := sarama.NewConsumerGroup([]string{envs.Kafka.Addr}, envs.Kafka.Topic, cfg)
+	kafkaClient, err := sarama.NewClient([]string{envs.Kafka.Addr}, cfg)
 	if err != nil {
-		return errors.Wrapf(err, "failed to init consumer group %q", envs.Kafka.Topic)
+		return nil, errors.Wrap(err, "failed to connect to Kafka broker")
 	}
 
-	validateVoteHandler := amqp.NewValidateVote(
-		services.NewVoterValidator(envs.Gosuslugi.Host),
-	)
+	var consumerGroup sarama.ConsumerGroup
+	var validateVoterHandler sarama.ConsumerGroupHandler
+
+	if envs.Kafka.Topic.IsDead {
+		if consumerGroup, err = sarama.NewConsumerGroupFromClient(envs.Kafka.GroupID, kafkaClient); err != nil {
+			return nil, errors.Wrapf(err, "failed to init Kafka consumer group %q", envs.Kafka.GroupID)
+		}
+
+		validateVoterHandler = amqp.NewValidateVoterDead(
+			envs.Kafka.Topic.Dead.ConsumptionInterval,
+			validatorService,
+		)
+
+		close = func() error {
+			if err := consumerGroup.Close(); err != nil {
+				return errors.Wrapf(err, "failed to close consumer group %q", envs.Kafka.GroupID)
+			}
+			return nil
+		}
+	} else {
+		votesProducerDead, err := sarama.NewAsyncProducerFromClient(kafkaClient)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to init Kafka producer")
+		}
+
+		go func() {
+			for err := range votesProducerDead.Errors() {
+				log.Error().Stack().Err(err).Msg("main: Producer error")
+			}
+		}()
+
+		if consumerGroup, err = sarama.NewConsumerGroupFromClient(envs.Kafka.GroupID, kafkaClient); err != nil {
+			return nil, errors.Wrapf(err, "failed to init Kafka consumer group %q", envs.Kafka.GroupID)
+		}
+
+		validateVoterHandler = amqp.NewValidateVoter(
+			envs.Kafka.Topic.Dead.Name,
+			validatorService,
+			votesProducerDead,
+		)
+
+		close = func() error {
+			if err := consumerGroup.Close(); err != nil {
+				return errors.Wrapf(err, "failed to close consumer group %q", envs.Kafka.GroupID)
+			}
+			if err := votesProducerDead.Close(); err != nil {
+				return errors.Wrapf(err, "failed to closed dead votes producer to topic=%s", envs.Kafka.Topic.Dead.Name)
+			}
+			return nil
+		}
+	}
 
 	go func() {
 		for err := range consumerGroup.Errors() {
-			log.Error().Stack().Err(err).Msg("handlers.amqp: Consumer error")
+			log.Error().Stack().Err(err).Msg("main: Consumer error")
 		}
 	}()
+
 	go func() {
+		format := "main: Consuming from topic=%s, group ID=%s"
+		if envs.Kafka.Topic.IsDead {
+			format = "main: Consuming from dead topic=%s, group ID=%s"
+		}
+		log.Info().Msgf(format, envs.Kafka.Topic.Name, envs.Kafka.GroupID)
+
 		for {
-			if err := consumerGroup.Consume(ctx, []string{envs.Kafka.Topic}, validateVoteHandler); err != nil {
-				log.Fatal().Err(err).Msgf("main: Failed to consume from topic %q", envs.Kafka.Topic)
+			if err := consumerGroup.Consume(
+				ctx,
+				[]string{envs.Kafka.Topic.Name},
+				validateVoterHandler,
+			); err != nil {
+				log.Fatal().Err(err).Msgf("main: Failed to consume from topic=%s", envs.Kafka.Topic.Name)
 			}
+
 			if ctx.Err() != nil {
 				return
 			}
 		}
 	}()
 
-	sigint := make(chan os.Signal, 1)
-	signal.Notify(sigint, syscall.SIGINT)
-
-	sig := <-sigint
-	log.Info().Msgf("main: Waiting consumer group %q to complete", envs.Kafka.Topic)
-	cancel()
-	if err := consumerGroup.Close(); err != nil {
-		return errors.Wrapf(err, "failed to close consumer group %q", envs.Kafka.Topic)
-	}
-	log.Info().Msgf("main: Terminated via signal %q", sig)
-	return nil
+	return
 }

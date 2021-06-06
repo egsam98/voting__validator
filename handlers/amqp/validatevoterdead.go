@@ -1,6 +1,8 @@
 package amqp
 
 import (
+	"time"
+
 	"github.com/Shopify/sarama"
 	votingpb "github.com/egsam98/voting/proto"
 	"github.com/golang/protobuf/proto"
@@ -10,16 +12,23 @@ import (
 	"github.com/egsam98/voting/validator/services"
 )
 
-// ValidateVote is sarama consumer's handler to validate vote
-type ValidateVote struct {
-	service *services.VoterValidator
+// ValidateVoterDead is sarama consumer's handler to validate voter from dead topic
+type ValidateVoterDead struct {
+	interval time.Duration
+	service  *services.VoterValidator
 }
 
-func NewValidateVote(service *services.VoterValidator) *ValidateVote {
-	return &ValidateVote{service: service}
+func NewValidateVoterDead(
+	interval time.Duration,
+	service *services.VoterValidator,
+) *ValidateVoterDead {
+	return &ValidateVoterDead{
+		interval: interval,
+		service:  service,
+	}
 }
 
-func (v *ValidateVote) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+func (v *ValidateVoterDead) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
 		vote := &votingpb.Vote{}
 		if err := proto.Unmarshal(msg.Value, vote); err != nil {
@@ -34,18 +43,20 @@ func (v *ValidateVote) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 			Msg("handlers.amqp: Received message")
 
 		if err := v.service.Run(session.Context(), vote); err != nil {
+			time.Sleep(v.interval)
 			return err
 		}
 
+		time.Sleep(v.interval)
 		session.MarkMessage(msg, "")
 	}
 	return nil
 }
 
-func (v *ValidateVote) Setup(sarama.ConsumerGroupSession) error {
+func (v *ValidateVoterDead) Setup(sarama.ConsumerGroupSession) error {
 	return nil
 }
 
-func (v *ValidateVote) Cleanup(sarama.ConsumerGroupSession) error {
+func (v *ValidateVoterDead) Cleanup(sarama.ConsumerGroupSession) error {
 	return nil
 }
