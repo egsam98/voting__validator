@@ -23,14 +23,14 @@ var envs struct {
 	Kafka struct {
 		Addr  string `envconfig:"KAFKA_ADDR"`
 		Topic struct {
-			IsDead bool   `envconfig:"KAFKA_TOPIC_IS_DEAD"`
-			Name   string `envconfig:"KAFKA_TOPIC_NAME"`
-			Dead   struct {
-				Name                string        `envconfig:"KAFKA_TOPIC_DEAD_NAME"`
-				ConsumptionInterval time.Duration `envconfig:"KAFKA_TOPIC_DEAD_CONSUMPTION_INTERVAL" default:"10s"`
-			}
+			IsDead    bool   `envconfig:"KAFKA_TOPIC_IS_DEAD"`
+			Name      string `envconfig:"KAFKA_TOPIC_NAME"`
+			ChainName string `envconfig:"KAFKA_TOPIC_CHAIN_NAME"`
 		}
-		GroupID string `envconfig:"KAFKA_GROUP_ID" required:"true"`
+		Consumer struct {
+			GroupID             string        `envconfig:"KAFKA_CONSUMER_GROUP_ID" required:"true"`
+			ConsumptionInterval time.Duration `envconfig:"KAFKA_CONSUMER_CONSUMPTION_INTERVAL" default:"10s"`
+		}
 	}
 	Gosuslugi struct {
 		Host string `envconfig:"GOSUSLUGI_HOST" required:"true"`
@@ -72,7 +72,7 @@ func run() error {
 	signal.Notify(sigint, syscall.SIGINT)
 
 	sig := <-sigint
-	log.Info().Msgf("main: Waiting consumer group %q to complete", envs.Kafka.GroupID)
+	log.Info().Msgf("main: Waiting consumer group %q to complete", envs.Kafka.Consumer.GroupID)
 	cancel()
 	if err := closeConsumer(); err != nil {
 		return err
@@ -82,7 +82,7 @@ func run() error {
 }
 
 // startConsumer selects consumer with type based on "KAFKA_TOPIC_IS_DEAD" env value and starts listening
-func startConsumer(ctx context.Context, validatorService *services.VoterValidator) (close func() error, err error) {
+func startConsumer(ctx context.Context, validatorService *services.VoterValidator) (func() error, error) {
 	cfg := sarama.NewConfig()
 	cfg.Producer.Return.Errors = true
 	cfg.Consumer.Return.Errors = true
@@ -93,56 +93,26 @@ func startConsumer(ctx context.Context, validatorService *services.VoterValidato
 		return nil, errors.Wrap(err, "failed to connect to Kafka broker")
 	}
 
-	var consumerGroup sarama.ConsumerGroup
-	var validateVoterHandler sarama.ConsumerGroupHandler
+	producer, err := sarama.NewSyncProducerFromClient(kafkaClient)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to init Kafka producer")
+	}
 
+	var options []amqp.ValidateVoterHandlerOption
 	if envs.Kafka.Topic.IsDead {
-		if consumerGroup, err = sarama.NewConsumerGroupFromClient(envs.Kafka.GroupID, kafkaClient); err != nil {
-			return nil, errors.Wrapf(err, "failed to init Kafka consumer group %q", envs.Kafka.GroupID)
-		}
+		options = append(options, amqp.WithTopicDead(envs.Kafka.Consumer.ConsumptionInterval))
+	}
 
-		validateVoterHandler = amqp.NewValidateVoterDead(
-			envs.Kafka.Topic.Dead.ConsumptionInterval,
-			validatorService,
-		)
+	validateVoterHandler := amqp.NewValidateVoterHandler(
+		envs.Kafka.Topic.ChainName,
+		validatorService,
+		producer,
+		options...,
+	)
 
-		close = func() error {
-			if err := consumerGroup.Close(); err != nil {
-				return errors.Wrapf(err, "failed to close consumer group %q", envs.Kafka.GroupID)
-			}
-			return nil
-		}
-	} else {
-		votesProducerDead, err := sarama.NewAsyncProducerFromClient(kafkaClient)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to init Kafka producer")
-		}
-
-		go func() {
-			for err := range votesProducerDead.Errors() {
-				log.Error().Stack().Err(err).Msg("main: Producer error")
-			}
-		}()
-
-		if consumerGroup, err = sarama.NewConsumerGroupFromClient(envs.Kafka.GroupID, kafkaClient); err != nil {
-			return nil, errors.Wrapf(err, "failed to init Kafka consumer group %q", envs.Kafka.GroupID)
-		}
-
-		validateVoterHandler = amqp.NewValidateVoter(
-			envs.Kafka.Topic.Dead.Name,
-			validatorService,
-			votesProducerDead,
-		)
-
-		close = func() error {
-			if err := consumerGroup.Close(); err != nil {
-				return errors.Wrapf(err, "failed to close consumer group %q", envs.Kafka.GroupID)
-			}
-			if err := votesProducerDead.Close(); err != nil {
-				return errors.Wrapf(err, "failed to closed dead votes producer to topic=%s", envs.Kafka.Topic.Dead.Name)
-			}
-			return nil
-		}
+	consumerGroup, err := sarama.NewConsumerGroupFromClient(envs.Kafka.Consumer.GroupID, kafkaClient)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to init Kafka consumer group %q", envs.Kafka.Consumer.GroupID)
 	}
 
 	go func() {
@@ -156,7 +126,7 @@ func startConsumer(ctx context.Context, validatorService *services.VoterValidato
 		if envs.Kafka.Topic.IsDead {
 			format = "main: Consuming from dead topic=%s, group ID=%s"
 		}
-		log.Info().Msgf(format, envs.Kafka.Topic.Name, envs.Kafka.GroupID)
+		log.Info().Msgf(format, envs.Kafka.Topic.Name, envs.Kafka.Consumer.GroupID)
 
 		for {
 			if err := consumerGroup.Consume(
@@ -173,5 +143,13 @@ func startConsumer(ctx context.Context, validatorService *services.VoterValidato
 		}
 	}()
 
-	return
+	return func() error {
+		if err := producer.Close(); err != nil {
+			return errors.Wrap(err, "failed to close Kafka producer")
+		}
+		if err := consumerGroup.Close(); err != nil {
+			return errors.Wrapf(err, "failed to close consumer group %q", envs.Kafka.Consumer.GroupID)
+		}
+		return nil
+	}, nil
 }

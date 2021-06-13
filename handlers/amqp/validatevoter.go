@@ -1,35 +1,56 @@
 package amqp
 
 import (
+	"time"
+
 	"github.com/Shopify/sarama"
 	votingpb "github.com/egsam98/voting/proto"
-	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/egsam98/voting/validator/services"
 )
 
-// ValidateVoter is sarama consumer's handler to validate voter
-type ValidateVoter struct {
-	topicDead         string
-	service           *services.VoterValidator
-	votesProducerDead sarama.AsyncProducer
-}
+type ValidateVoterHandlerOption func(*ValidateVoterHandler)
 
-func NewValidateVoter(
-	topicDead string,
-	service *services.VoterValidator,
-	votesProducerDead sarama.AsyncProducer,
-) *ValidateVoter {
-	return &ValidateVoter{
-		topicDead:         topicDead,
-		service:           service,
-		votesProducerDead: votesProducerDead,
+// WithTopicDead treats topic using dead letter queue pattern with provided consumption interval
+func WithTopicDead(consumptionInterval time.Duration) ValidateVoterHandlerOption {
+	return func(handler *ValidateVoterHandler) {
+		handler.isTopicDead = true
+		handler.consumptionInterval = consumptionInterval
 	}
 }
 
-func (v *ValidateVoter) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+// ValidateVoterHandler is sarama consumer's handler to validate voter
+type ValidateVoterHandler struct {
+	isTopicDead         bool
+	consumptionInterval time.Duration
+	chainTopic          string
+	service             *services.VoterValidator
+	producer            sarama.SyncProducer
+}
+
+func NewValidateVoterHandler(
+	chainTopic string,
+	service *services.VoterValidator,
+	producer sarama.SyncProducer,
+	options ...ValidateVoterHandlerOption,
+) *ValidateVoterHandler {
+	h := &ValidateVoterHandler{
+		chainTopic: chainTopic,
+		service:    service,
+		producer:   producer,
+	}
+
+	for _, option := range options {
+		option(h)
+	}
+
+	return h
+}
+
+func (v *ValidateVoterHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
 		vote := &votingpb.Vote{}
 		if err := proto.Unmarshal(msg.Value, vote); err != nil {
@@ -44,11 +65,32 @@ func (v *ValidateVoter) ConsumeClaim(session sarama.ConsumerGroupSession, claim 
 			Msg("handlers.amqp: Received message")
 
 		if err := v.service.Run(session.Context(), vote); err != nil {
-			v.votesProducerDead.Input() <- &sarama.ProducerMessage{
-				Topic: v.topicDead,
-				Value: sarama.ByteEncoder(msg.Value),
+			if v.isTopicDead {
+				time.Sleep(v.consumptionInterval)
+				return err
 			}
+
+			topicDead := msg.Topic + ".dead"
+			if _, _, err := v.producer.SendMessage(&sarama.ProducerMessage{
+				Topic: topicDead,
+				Value: sarama.ByteEncoder(msg.Value),
+			}); err != nil {
+				return errors.Wrapf(err, "failed to send message to topic %q", topicDead)
+			}
+
 			log.Error().Stack().Err(err).Msg("handlers.amqp: Vote handling error")
+			return nil
+		}
+
+		if _, _, err := v.producer.SendMessage(&sarama.ProducerMessage{
+			Topic: v.chainTopic,
+			Value: sarama.ByteEncoder(msg.Value),
+		}); err != nil {
+			return errors.Wrapf(err, "failed to send message to topic %q", v.chainTopic)
+		}
+
+		if v.isTopicDead {
+			time.Sleep(v.consumptionInterval)
 		}
 
 		session.MarkMessage(msg, "")
@@ -56,10 +98,10 @@ func (v *ValidateVoter) ConsumeClaim(session sarama.ConsumerGroupSession, claim 
 	return nil
 }
 
-func (v *ValidateVoter) Setup(sarama.ConsumerGroupSession) error {
+func (v *ValidateVoterHandler) Setup(sarama.ConsumerGroupSession) error {
 	return nil
 }
 
-func (v *ValidateVoter) Cleanup(sarama.ConsumerGroupSession) error {
+func (v *ValidateVoterHandler) Cleanup(sarama.ConsumerGroupSession) error {
 	return nil
 }
