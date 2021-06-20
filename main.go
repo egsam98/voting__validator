@@ -16,7 +16,7 @@ import (
 	"github.com/rs/zerolog/pkgerrors"
 
 	"github.com/egsam98/voting/validator/handlers/amqp"
-	"github.com/egsam98/voting/validator/services"
+	"github.com/egsam98/voting/validator/services/votervalidator"
 )
 
 var envs struct {
@@ -61,7 +61,7 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	validatorService := services.NewVoterValidator(envs.Gosuslugi.Host)
+	validatorService := votervalidator.New(envs.Gosuslugi.Host)
 
 	closeConsumer, err := startConsumer(ctx, validatorService)
 	if err != nil {
@@ -82,7 +82,7 @@ func run() error {
 }
 
 // startConsumer selects consumer with type based on "KAFKA_TOPIC_IS_DEAD" env value and starts listening
-func startConsumer(ctx context.Context, validatorService *services.VoterValidator) (func() error, error) {
+func startConsumer(ctx context.Context, validatorService *votervalidator.VoterValidator) (func() error, error) {
 	cfg := sarama.NewConfig()
 	cfg.Producer.Return.Errors = true
 	cfg.Consumer.Return.Errors = true

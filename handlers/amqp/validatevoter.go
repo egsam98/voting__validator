@@ -9,7 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/egsam98/voting/validator/services"
+	"github.com/egsam98/voting/validator/services/votervalidator"
 )
 
 type ValidateVoterHandlerOption func(*ValidateVoterHandler)
@@ -27,19 +27,19 @@ type ValidateVoterHandler struct {
 	isTopicDead         bool
 	consumptionInterval time.Duration
 	chainTopic          string
-	service             *services.VoterValidator
+	validator           *votervalidator.VoterValidator
 	producer            sarama.SyncProducer
 }
 
 func NewValidateVoterHandler(
 	chainTopic string,
-	service *services.VoterValidator,
+	validator *votervalidator.VoterValidator,
 	producer sarama.SyncProducer,
 	options ...ValidateVoterHandlerOption,
 ) *ValidateVoterHandler {
 	h := &ValidateVoterHandler{
 		chainTopic: chainTopic,
-		service:    service,
+		validator:  validator,
 		producer:   producer,
 	}
 
@@ -50,6 +50,7 @@ func NewValidateVoterHandler(
 	return h
 }
 
+// TODO: handle unexpedcted errors
 func (v *ValidateVoterHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
 		vote := &votingpb.Vote{}
@@ -57,14 +58,30 @@ func (v *ValidateVoterHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 			return errors.Wrapf(err, "failed to unmarshal data=%s", string(msg.Value))
 		}
 
+		if vote.CandidateId == 0 {
+			return errors.Errorf("candidate ID must be non-empty")
+		}
+		if vote.Voter.GetPassport() == "" {
+			return errors.Errorf("voter's passport must be non-empty")
+		}
+		if vote.Voter.GetFullname() == "" {
+			return errors.Errorf("voter's fullname must be non-empty")
+		}
+
 		log.Debug().
 			Str("topic", msg.Topic).
 			Int32("partition", msg.Partition).
 			Int64("offset", msg.Offset).
 			Interface("vote", vote).
-			Msg("handlers.amqp: Received message")
+			Msg("amqp.ValidateVoterHandler: Received message")
 
-		if err := v.service.Run(session.Context(), vote); err != nil {
+		upVoter, err := v.validator.Run(session.Context(), vote.Voter)
+		if err != nil {
+			if errors.Is(err, votervalidator.ErrInvalidVoter) {
+				log.Warn().Err(err).Msg("amqp.ValidateVoterHandler: Invalid voter")
+				continue
+			}
+
 			if v.isTopicDead {
 				time.Sleep(v.consumptionInterval)
 				return err
@@ -78,13 +95,19 @@ func (v *ValidateVoterHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 				return errors.Wrapf(err, "failed to send message to topic %q", topicDead)
 			}
 
-			log.Error().Stack().Err(err).Msg("handlers.amqp: Vote handling error")
+			log.Error().Stack().Err(err).Msg("amqp.ValidateVoterHandler: Vote handling error")
 			return nil
+		}
+
+		vote.Voter = upVoter
+		updB, err := proto.Marshal(vote)
+		if err != nil {
+			return errors.Wrapf(err, "failed to marshal %T to bytes", vote)
 		}
 
 		if _, _, err := v.producer.SendMessage(&sarama.ProducerMessage{
 			Topic: v.chainTopic,
-			Value: sarama.ByteEncoder(msg.Value),
+			Value: sarama.ByteEncoder(updB),
 		}); err != nil {
 			return errors.Wrapf(err, "failed to send message to topic %q", v.chainTopic)
 		}
