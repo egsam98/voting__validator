@@ -21,14 +21,14 @@ import (
 
 var envs struct {
 	Kafka struct {
-		Addr  string `envconfig:"KAFKA_ADDR"`
+		Addr  string `envconfig:"KAFKA_ADDR" required:"true"`
 		Topic struct {
-			IsDead    bool   `envconfig:"KAFKA_TOPIC_IS_DEAD"`
-			Name      string `envconfig:"KAFKA_TOPIC_NAME"`
-			ChainName string `envconfig:"KAFKA_TOPIC_CHAIN_NAME"`
+			IsDead    bool   `envconfig:"KAFKA_TOPIC_IS_DEAD" default:"false"`
+			Name      string `envconfig:"KAFKA_TOPIC_NAME" required:"true"`
+			ChainName string `envconfig:"KAFKA_TOPIC_CHAIN_NAME" required:"true"`
 		}
 		Consumer struct {
-			GroupID             string        `envconfig:"KAFKA_CONSUMER_GROUP_ID" required:"true"`
+			GroupID             string        `envconfig:"KAFKA_CONSUMER_GROUP_ID" default:"validator"`
 			ConsumptionInterval time.Duration `envconfig:"KAFKA_CONSUMER_CONSUMPTION_INTERVAL" default:"10s"`
 		}
 	}
