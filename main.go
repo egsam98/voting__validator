@@ -85,6 +85,7 @@ func run() error {
 func startConsumer(ctx context.Context, validatorService *votervalidator.VoterValidator) (func() error, error) {
 	cfg := sarama.NewConfig()
 	cfg.Producer.Return.Errors = true
+	cfg.Producer.Return.Successes = true
 	cfg.Consumer.Return.Errors = true
 	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
 
