@@ -57,7 +57,20 @@ func (v *VoterValidator) Run(ctx context.Context, voter *votingpb.Voter) (*votin
 	}()
 
 	if res.StatusCode == http.StatusOK {
-		return nil, nil
+		updVoter := &votingpb.Voter{}
+		if err := json.NewDecoder(res.Body).Decode(updVoter); err != nil {
+			return nil, errors.Wrapf(err, "failed to decode JSON to %T", updVoter)
+		}
+
+		if updVoter.Fullname != voter.Fullname {
+			return nil, errors.Wrap(ErrInvalidVoter, "fullnames don't match")
+		}
+
+		if updVoter.DeathDate != nil {
+			return nil, errors.Wrapf(ErrInvalidVoter, "voter died in %v", updVoter.DeathDate)
+		}
+
+		return updVoter, nil
 	}
 
 	if res.StatusCode == http.StatusBadRequest {
@@ -73,18 +86,5 @@ func (v *VoterValidator) Run(ctx context.Context, voter *votingpb.Voter) (*votin
 		return nil, errors.Wrap(ErrInvalidInput, errRes.Error)
 	}
 
-	updVoter := &votingpb.Voter{}
-	if err := json.NewDecoder(res.Body).Decode(updVoter); err != nil {
-		return nil, errors.Wrapf(err, "failed to decode JSON to %T", updVoter)
-	}
-
-	if updVoter.Fullname != voter.Fullname {
-		return nil, errors.Wrap(ErrInvalidVoter, "fullnames don't match")
-	}
-
-	if updVoter.DeathDate != nil {
-		return nil, errors.Wrapf(ErrInvalidVoter, "voter died in %v", updVoter.DeathDate)
-	}
-
-	return updVoter, nil
+	return nil, errors.Errorf("%s %d: internal Gosuslugi error", res.Status, res.StatusCode)
 }
