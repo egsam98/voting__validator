@@ -94,13 +94,7 @@ func (v *ValidateVoterHandler) processMessage(ctx context.Context, msg *sarama.C
 		Interface("vote", vote).
 		Msg("amqp.ValidateVoterHandler: Received message")
 
-	upVoter, err := v.validator.Run(ctx, vote.Voter)
-	if err != nil {
-		if errors.Is(err, votervalidator.ErrInvalidVoter) {
-			log.Warn().Err(err).Msg("amqp.ValidateVoterHandler: Invalid voter")
-			return nil
-		}
-
+	if err := v.validator.Run(ctx, vote); err != nil {
 		if v.isTopicDead {
 			time.Sleep(v.consumptionInterval)
 			return err
@@ -118,15 +112,14 @@ func (v *ValidateVoterHandler) processMessage(ctx context.Context, msg *sarama.C
 		return nil
 	}
 
-	vote.Voter = upVoter
-	updB, err := proto.Marshal(vote)
+	b, err := proto.Marshal(vote)
 	if err != nil {
 		return errors.Wrapf(err, "failed to marshal %T to bytes", vote)
 	}
 
 	if _, _, err := v.producer.SendMessage(&sarama.ProducerMessage{
 		Topic: v.chainTopic,
-		Value: sarama.ByteEncoder(updB),
+		Value: sarama.ByteEncoder(b),
 	}); err != nil {
 		return errors.Wrapf(err, "failed to send message to topic %q", v.chainTopic)
 	}
